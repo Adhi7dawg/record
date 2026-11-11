@@ -1,0 +1,273 @@
+import { firebaseConfig } from "./firebase-config.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
+import {
+  getAuth, onAuthStateChanged, createUserWithEmailAndPassword,
+  signInWithEmailAndPassword, sendPasswordResetEmail, signOut
+} from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDocs, getDoc, setDoc, addDoc,
+  updateDoc, deleteDoc, query, orderBy, serverTimestamp
+} from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
+
+const $ = (id) => document.getElementById(id);
+const configReady = firebaseConfig.apiKey && !firebaseConfig.apiKey.startsWith("GANTI_") && firebaseConfig.projectId && !firebaseConfig.projectId.startsWith("GANTI_");
+let auth, db, currentUser = null, albums = [], rankings = [], authMode = "login";
+let editingAlbumId = null, editingRankingId = null, selectedRankingId = null, collectionView = "grid", draggedRankId = null;
+const albumDialog = $("album-dialog"), rankingDialog = $("ranking-dialog"), detailDialog = $("detail-dialog");
+const owned = () => albums.filter(a => a.status !== "wishlist");
+const wishlist = () => albums.filter(a => a.status === "wishlist");
+const userAlbums = () => collection(db, "users", currentUser.uid, "albums");
+const userRankings = () => collection(db, "users", currentUser.uid, "rankings");
+const safeText = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const initials = (s) => (s || "RC").split(/\s+/).slice(0,2).map(x => x[0] || "").join("").toUpperCase();
+const coverMarkup = (a, cls="album-cover") => `<div class="${cls}">${a.coverUrl ? `<img src="${safeText(a.coverUrl)}" alt="${safeText(a.title)} cover" loading="lazy" onerror="this.remove();this.parentElement.innerHTML='<span class=&quot;cover-fallback&quot;>${safeText(initials(a.title))}</span>'">` : `<span class="cover-fallback">${safeText(initials(a.title))}</span>`}</div>`;
+const dateValue = (v) => v?.toDate ? v.toDate() : (v ? new Date(v) : null);
+const fmtDate = (v) => { const d=dateValue(v); return d && !isNaN(d) ? d.toLocaleDateString("id-ID",{day:"numeric",month:"short",year:"numeric"}) : "—"; };
+function toast(message){const t=$("toast");t.textContent=message;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2600)}
+function setNotice(message){$("notice").textContent=message;$("notice").classList.toggle("hidden",!message)}
+function showPage(name){
+  document.querySelectorAll(".page").forEach(p=>p.classList.toggle("active",p.id===`page-${name}`));
+  document.querySelectorAll(".nav-item[data-page]").forEach(b=>b.classList.toggle("active",b.dataset.page===name));
+  $("sidebar").classList.remove("open");
+  if(name==="statistics")renderStatistics();
+  if(name==="timeline")renderTimeline();
+  if(name==="rankings")renderRankings();
+  if(name==="collection")renderCollection();
+  if(name==="wishlist")renderWishlist();
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+function empty(message){return `<p class="empty-note">${safeText(message)}</p>`}
+function card(a, showActions=false){
+  const id=safeText(a.id);
+  return `<article class="album-card" data-album-id="${id}">
+    ${coverMarkup(a)}
+    <div class="album-meta"><h3>${safeText(a.title)}</h3><p>${safeText(a.artist)}</p>
+    <div class="album-meta-line"><span>${safeText(a.releaseYear || "YEAR UNKNOWN")}</span><span class="rating">${a.rating !== "" && a.rating != null ? `★ ${safeText(a.rating)}` : "UNRATED"}</span></div>
+    ${showActions?`<div class="card-actions"><button class="tiny-button" data-edit="${id}">Edit</button><button class="tiny-button" data-delete="${id}">Remove</button></div>`:""}</div></article>`;
+}
+function miniRow(a){return `<div class="mini-row" data-album-id="${safeText(a.id)}">${a.coverUrl?`<img src="${safeText(a.coverUrl)}" alt="" onerror="this.style.display='none'">`:`<span class="mini-cover">${safeText(initials(a.title))}</span>`}<span><strong>${safeText(a.title)}</strong><small>${safeText(a.artist)}</small></span></div>`}
+function bindAlbumCards(container){
+  container.querySelectorAll("[data-album-id]").forEach(el=>el.addEventListener("click",e=>{
+    if(e.target.closest("button"))return;openDetail(el.dataset.albumId);
+  }));
+  container.querySelectorAll("[data-edit]").forEach(b=>b.addEventListener("click",e=>{e.stopPropagation();openAlbumForm(b.dataset.edit)}));
+  container.querySelectorAll("[data-delete]").forEach(b=>b.addEventListener("click",e=>{e.stopPropagation();removeAlbum(b.dataset.delete)}));
+}
+function renderOverview(){
+  const own=owned(), wish=wishlist(), artists=new Set(own.map(a=>a.artist.toLowerCase())).size;
+  $("overview-total").textContent=own.length;$("overview-artists").textContent=artists;$("overview-wishlist").textContent=wish.length;
+  const rated=own.filter(a=>a.rating!==""&&a.rating!=null&&Number.isFinite(Number(a.rating)));
+  $("overview-rating").textContent=rated.length?(rated.reduce((s,a)=>s+Number(a.rating),0)/rated.length).toFixed(1):"—";
+  $("nav-owned-count").textContent=own.length;
+  const recent=[...own].sort((a,b)=>timeOf(b.dateAdded)-timeOf(a.dateAdded)).slice(0,5);
+  $("recent-grid").innerHTML=recent.length?recent.map(a=>card(a)).join(""):empty("Your shelf is empty. Add the first album to begin your archive.");
+  bindAlbumCards($("recent-grid"));
+  $("overview-wishlist-list").innerHTML=wish.length?wish.slice(0,4).map(miniRow).join(""):empty("No albums on your discovery list yet.");
+  $("overview-favorites").innerHTML=own.filter(a=>a.isFavorite).slice(0,4).map(miniRow).join("")||empty("Favorite records will appear here.");
+  [$("overview-wishlist-list"),$("overview-favorites")].forEach(bindAlbumCards);
+  const featured=own.find(a=>a.isAlbumOfMonth);
+  $("monthly-title").textContent=featured?.title||"Not chosen yet.";
+  $("monthly-copy").textContent=featured?`${featured.artist} · ${featured.releaseYear||"Year unknown"}`:"Choose an album from its edit form to feature it here.";
+  $("monthly-cover").innerHTML=featured?(featured.coverUrl?`<img src="${safeText(featured.coverUrl)}" alt="" style="width:100%;height:100%;object-fit:cover">`:safeText(initials(featured.title))):"RC";
+}
+function timeOf(v){const d=dateValue(v);return d&&!isNaN(d)?d.getTime():0}
+function renderCollection(){
+  const term=$("collection-search").value.toLowerCase().trim(), genre=$("filter-genre").value, year=$("filter-year").value, rating=$("filter-rating").value, sort=$("sort-collection").value;
+  let list=owned().filter(a=>(!term||`${a.title} ${a.artist}`.toLowerCase().includes(term))&&(!genre||a.genre===genre)&&(!year||String(a.releaseYear||"")===year)&&(!rating||(a.rating!==""&&a.rating!=null&&Number(a.rating)>=Number(rating))));
+  list.sort((a,b)=>sort==="rating"?Number(b.rating||0)-Number(a.rating||0):sort==="year-new"?Number(b.releaseYear||0)-Number(a.releaseYear||0):sort==="year-old"?Number(a.releaseYear||99999)-Number(b.releaseYear||99999):sort==="title"?a.title.localeCompare(b.title):sort==="artist"?a.artist.localeCompare(b.artist):timeOf(b.dateAdded)-timeOf(a.dateAdded));
+  $("collection-count").textContent=`${list.length} RECORD${list.length===1?"":"S"} SHOWN`;
+  $("collection-grid").classList.toggle("list-view",collectionView==="list");
+  $("collection-grid").innerHTML=list.length?list.map(a=>card(a,true)).join(""):empty(owned().length?"No albums match those filters.":"Nothing on the shelf yet. Add an album to get started.");
+  bindAlbumCards($("collection-grid"));
+  const genres=[...new Set(owned().map(a=>a.genre).filter(Boolean))].sort();
+  const years=[...new Set(owned().map(a=>String(a.releaseYear||"")).filter(Boolean))].sort((a,b)=>b-a);
+  setOptions($("filter-genre"),genres,"All genres");setOptions($("filter-year"),years,"All years");
+}
+function setOptions(el,values,first){const old=el.value;el.innerHTML=`<option value="">${first}</option>`+values.map(v=>`<option value="${safeText(v)}">${safeText(v)}</option>`).join("");if(values.includes(old))el.value=old}
+function renderWishlist(){
+  const list=wishlist().sort((a,b)=>timeOf(b.dateAdded)-timeOf(a.dateAdded));
+  $("wishlist-grid").innerHTML=list.length?list.map(a=>`${card(a,true)}<div class="wishlist-note">${a.note?safeText(a.note):""}</div>`).join(""):empty("Your want-to-listen list is clear. Add records you want to hear next.");
+  bindAlbumCards($("wishlist-grid"));
+}
+function renderTimeline(){
+  const artist=$("timeline-artist").value.toLowerCase().trim(),genre=$("timeline-genre").value,period=$("timeline-period").value;
+  let list=owned().filter(a=>(!artist||a.artist.toLowerCase().includes(artist))&&(!genre||a.genre===genre));
+  if(period==="unknown")list=list.filter(a=>!a.releaseYear);
+  else if(period==="older")list=list.filter(a=>a.releaseYear&&Number(a.releaseYear)<1970);
+  else if(period)list=list.filter(a=>a.releaseYear&&Math.floor(Number(a.releaseYear)/10)*10===Number(period));
+  const groups={};list.forEach(a=>{const y=a.releaseYear?String(a.releaseYear):"Unknown Year";(groups[y]??=[]).push(a)});
+  const years=Object.keys(groups).sort((a,b)=>a==="Unknown Year"?1:b==="Unknown Year"?-1:Number(b)-Number(a));
+  $("timeline-content").innerHTML=years.length?years.map(y=>`<div class="timeline-year ${y==="Unknown Year"?"timeline-unknown":""}"><h2>${safeText(y)}</h2><div class="timeline-albums">${groups[y].map(a=>card(a)).join("")}</div></div>`).join(""):empty("No albums match this timeline filter.");
+  bindAlbumCards($("timeline-content"));
+  setOptions($("timeline-genre"),[...new Set(owned().map(a=>a.genre).filter(Boolean))].sort(),"All genres");
+}
+function renderRankings(){
+  const host=$("ranking-content");
+  if(!rankings.length){host.innerHTML=`<div class="ranking-list-picker">${empty("No rankings yet. Create your first personal list.")}</div><div class="ranking-detail">${empty("Your lists are completely manual — no automatic rating sort.")}</div>`;return}
+  if(!rankings.some(r=>r.id===selectedRankingId))selectedRankingId=rankings[0].id;
+  const selected=rankings.find(r=>r.id===selectedRankingId);
+  host.innerHTML=`<div class="ranking-list-picker">${rankings.map(r=>`<button class="ranking-picker-item ${r.id===selected.id?"active":""}" data-ranking="${safeText(r.id)}"><strong>${safeText(r.title)}</strong><small>${(r.albumIds||[]).length} ALBUMS</small></button>`).join("")}</div>
+  <div class="ranking-detail"><div class="ranking-detail-head"><div><p class="eyebrow">YOUR LIST / ${String(rankings.indexOf(selected)+1).padStart(2,"0")}</p><h2>${safeText(selected.title)}</h2><p>${safeText(selected.description||"No description.")}</p></div><div class="card-actions"><button class="tiny-button" id="edit-ranking">Edit</button><button class="tiny-button" id="delete-ranking">Delete list</button></div></div>
+  <div class="ranking-items" id="ranking-items">${(selected.albumIds||[]).map((id,i)=>{const a=albums.find(x=>x.id===id);return a?`<div class="ranked-item" draggable="true" data-rank-album="${safeText(id)}"><span class="rank-number">${String(i+1).padStart(2,"0")}</span>${a.coverUrl?`<img src="${safeText(a.coverUrl)}" alt="">`:`<span class="mini-cover">${safeText(initials(a.title))}</span>`}<span><strong>${safeText(a.title)}</strong><small>${safeText(a.artist)}</small></span><button class="tiny-button" data-move-up="${safeText(id)}" aria-label="Move up">↑</button><button class="tiny-button" data-move-down="${safeText(id)}" aria-label="Move down">↓</button><button class="tiny-button remove-rank" data-remove-rank="${safeText(id)}">Remove</button></div>`:""}).join("")||empty("This ranking is empty. Add albums from your collection.")}</div>
+  <div class="ranking-add-row"><select id="ranking-add-album"><option value="">Add an album from your collection…</option>${owned().filter(a=>!(selected.albumIds||[]).includes(a.id)).map(a=>`<option value="${safeText(a.id)}">${safeText(a.title)} — ${safeText(a.artist)}</option>`).join("")}</select><button id="ranking-add-button" class="button button-outline">Add</button></div></div>`;
+  host.querySelectorAll("[data-ranking]").forEach(b=>b.addEventListener("click",()=>{selectedRankingId=b.dataset.ranking;renderRankings()}));
+  $("edit-ranking").onclick=()=>openRankingForm(selected);
+  $("delete-ranking").onclick=()=>deleteRanking(selected.id);
+  $("ranking-add-button").onclick=()=>addToRanking(selected.id,$("ranking-add-album").value);
+  host.querySelectorAll("[data-remove-rank]").forEach(b=>b.onclick=()=>removeFromRanking(selected.id,b.dataset.removeRank));
+  host.querySelectorAll("[data-move-up]").forEach(b=>b.onclick=()=>shiftRank(selected.id,b.dataset.moveUp,-1));
+  host.querySelectorAll("[data-move-down]").forEach(b=>b.onclick=()=>shiftRank(selected.id,b.dataset.moveDown,1));
+  const items=$("ranking-items");
+  items.querySelectorAll("[data-rank-album]").forEach(el=>{
+    el.addEventListener("dragstart",()=>{draggedRankId=el.dataset.rankAlbum;el.classList.add("dragging")});
+    el.addEventListener("dragend",()=>{draggedRankId=null;el.classList.remove("dragging")});
+    el.addEventListener("dragover",e=>e.preventDefault());
+    el.addEventListener("drop",e=>{e.preventDefault();const target=el.dataset.rankAlbum;if(draggedRankId&&target&&draggedRankId!==target)reorderRanking(selected.id,draggedRankId,target)});
+  });
+}
+function renderStatistics(){
+  const own=owned(),rated=own.filter(a=>a.rating!==""&&a.rating!=null),avg=rated.length?(rated.reduce((s,a)=>s+Number(a.rating),0)/rated.length).toFixed(1):"—";
+  const artists=new Set(own.map(a=>a.artist.toLowerCase())).size;
+  const genreCounts=countBy(own,a=>a.genre||"Unspecified"),yearCounts=countBy(own,a=>a.releaseYear?String(Math.floor(Number(a.releaseYear)/10)*10)+"s":"Unknown");
+  const months=countBy(own,a=>{const d=dateValue(a.dateAdded);return d&&!isNaN(d)?d.toLocaleDateString("en-US",{month:"short",year:"numeric"}):"Unknown"});
+  const top=[...rated].sort((a,b)=>Number(b.rating)-Number(a.rating))[0];
+  $("statistics-content").innerHTML=`<div class="stats-grid"><div class="stat-card"><span class="eyebrow">TOTAL ALBUMS</span><strong>${own.length}</strong><small>IN YOUR COLLECTION</small></div><div class="stat-card"><span class="eyebrow">UNIQUE ARTISTS</span><strong>${artists}</strong><small>BASED ON ARTIST NAME</small></div><div class="stat-card"><span class="eyebrow">AVERAGE RATING</span><strong>${avg}</strong><small>${rated.length} RATED ALBUMS</small></div><div class="stat-card"><span class="eyebrow">WISHLIST</span><strong>${wishlist().length}</strong><small>WAITING TO BE HEARD</small></div><div class="stat-card"><span class="eyebrow">TOP RATED</span><strong>${top?safeText(top.rating):"—"}</strong><small>${top?safeText(top.title):"NO RATINGS YET"}</small></div><div class="stat-card"><span class="eyebrow">GENRES</span><strong>${Object.keys(genreCounts).filter(k=>k!=="Unspecified").length}</strong><small>GENRES REPRESENTED</small></div></div>
+  ${barChart("GENRES IN YOUR COLLECTION",genreCounts)}${barChart("RELEASE DECADES",yearCounts)}${barChart("ALBUMS ADDED BY MONTH",months)}`;
+}
+function countBy(list,fn){return list.reduce((o,x)=>{const k=fn(x);o[k]=(o[k]||0)+1;return o},{})}
+function barChart(title,data){const entries=Object.entries(data).sort((a,b)=>b[1]-a[1]).slice(0,8),max=Math.max(1,...entries.map(x=>x[1]));return `<div class="chart-sheet"><p class="eyebrow">${title}</p>${entries.length?entries.map(([k,v])=>`<div class="bar-row"><span>${safeText(k)}</span><div class="bar-track"><div class="bar-fill" style="width:${v/max*100}%"></div></div><b>${v}</b></div>`).join(""):empty("Not enough data yet.")}</div>`}
+async function loadData(){
+  const [a,r]=await Promise.all([getDocs(query(userAlbums(),orderBy("dateAdded","desc"))).catch(()=>getDocs(userAlbums())),getDocs(userRankings()).catch(()=>getDocs(userRankings()))]);
+  albums=a.docs.map(d=>({id:d.id,...d.data()}));rankings=r.docs.map(d=>({id:d.id,...d.data()}));
+  renderOverview();renderCollection();renderWishlist();renderTimeline();renderRankings();
+}
+function setAuthMode(mode){
+  authMode=mode;const reg=mode==="register";
+  $("auth-title").textContent=reg?"Create your archive.":"Welcome back.";
+  $("auth-kicker").textContent=reg?"START YOUR PERSONAL ARCHIVE":"YOUR PRIVATE ARCHIVE";
+  $("auth-subtitle").textContent=reg?"One account. A lifetime of listening.":"Sign in to return to your collection.";
+  $("confirm-wrap").classList.toggle("hidden",!reg);$("forgot-password").classList.toggle("hidden",reg);
+  $("auth-submit").innerHTML=reg?'Create account <span>↗</span>':'Sign in <span>↗</span>';
+  $("auth-switch-copy").innerHTML=reg?'Already have an account? <button id="auth-switch" class="text-button link-button">Sign in</button>':'New here? <button id="auth-switch" class="text-button link-button">Create an account</button>';
+  $("auth-password").autocomplete=reg?"new-password":"current-password";
+  $("auth-switch").onclick=()=>setAuthMode(reg?"login":"register");$("auth-message").textContent="";
+}
+async function handleAuth(e){
+  e.preventDefault();$("auth-message").textContent="";
+  const email=$("auth-email").value.trim(),password=$("auth-password").value;
+  try{
+    if(authMode==="register"){
+      if(password.length<6)throw new Error("Password minimal 6 karakter.");
+      if(password!==$("auth-confirm").value)throw new Error("Konfirmasi password tidak cocok.");
+      const cred=await createUserWithEmailAndPassword(auth,email,password);
+      await setDoc(doc(db,"users",cred.user.uid),{email,createdAt:serverTimestamp()});
+    }else await signInWithEmailAndPassword(auth,email,password);
+  }catch(err){$("auth-message").textContent=authError(err)}
+}
+function authError(err){const code=err.code||"";return code.includes("email-already-in-use")?"Email ini sudah terdaftar.":code.includes("invalid-email")?"Format email tidak valid.":code.includes("weak-password")?"Password terlalu lemah.":code.includes("user-not-found")||code.includes("invalid-credential")?"Email atau password salah.":code.includes("too-many-requests")?"Terlalu banyak percobaan. Coba lagi nanti.":err.message||"Terjadi kesalahan."}
+function openAlbumForm(id=null,initial=null){
+  editingAlbumId=id;const a=id?albums.find(x=>x.id===id):initial||{};
+  $("album-modal-kicker").textContent=id?"EDIT YOUR RECORD":"ADD TO ARCHIVE";$("album-modal-title").textContent=id?"Edit album":"Add an album";
+  $("album-form").reset();$("lookup-results").innerHTML="";$("album-form-message").textContent="";
+  $("album-title").value=a.title||"";$("album-artist").value=a.artist||"";$("album-year").value=a.releaseYear||"";
+  $("album-genre").value=a.genre||"";$("album-cover").value=a.coverUrl||"";$("album-listened").value=a.listeningDate||"";
+  $("album-rating").value=a.rating??"";$("album-tracks").value=Array.isArray(a.tracklist)?a.tracklist.join("\n"):(a.tracklist||"");
+  $("album-review").value=a.review||"";$("album-favorite").checked=!!a.isFavorite;$("album-month").checked=!!a.isAlbumOfMonth;
+  if(a.status==="wishlist"){$("album-modal-kicker").textContent="DISCOVERY LIST";$("album-form-message").textContent="Save this record to your collection when ready."}
+  albumDialog.showModal();
+}
+async function saveAlbum(e){
+  e.preventDefault();const title=$("album-title").value.trim(),artist=$("album-artist").value.trim();
+  if(!title||!artist)return;
+  const data={title,artist,releaseYear:$("album-year").value?Number($("album-year").value):null,genre:$("album-genre").value.trim(),coverUrl:$("album-cover").value.trim(),listeningDate:$("album-listened").value,rating:$("album-rating").value===""?null:Number($("album-rating").value),tracklist:$("album-tracks").value.split("\n").map(x=>x.trim()).filter(Boolean),review:$("album-review").value.trim(),isFavorite:$("album-favorite").checked,isAlbumOfMonth:$("album-month").checked,status:$("album-status").value,note:$("album-note").value.trim(),updatedAt:serverTimestamp()};
+  if(data.isAlbumOfMonth)await Promise.all(owned().filter(a=>a.id!==editingAlbumId&&a.isAlbumOfMonth).map(a=>updateDoc(doc(userAlbums(),a.id),{isAlbumOfMonth:false})));
+  const duplicate=owned().find(a=>a.id!==editingAlbumId&&a.title.toLowerCase()===title.toLowerCase()&&a.artist.toLowerCase()===artist.toLowerCase());
+  if(duplicate&&!confirm(`Album "${title}" oleh ${artist} sudah ada. Tetap simpan sebagai album terpisah?`))return;
+  try{
+    if(editingAlbumId)await updateDoc(doc(userAlbums(),editingAlbumId),data);
+    else await addDoc(userAlbums(),{...data,dateAdded:serverTimestamp(),userId:currentUser.uid});
+    albumDialog.close();await loadData();toast(editingAlbumId?"Album updated.":"Album added to your archive.");
+  }catch(err){$("album-form-message").textContent=err.message}
+}
+async function lookupAlbums(){
+  const term=$("album-lookup").value.trim();if(!term)return;
+  $("lookup-results").innerHTML=empty("Searching MusicBrainz…");
+  try{
+    const url=`https://musicbrainz.org/ws/2/release-group/?query=${encodeURIComponent(term)}&fmt=json&limit=8`;
+    const res=await fetch(url,{headers:{"Accept":"application/json"}});if(!res.ok)throw new Error("MusicBrainz is temporarily unavailable.");
+    const data=await res.json();const results=data["release-groups"]||[];
+    if(!results.length){$("lookup-results").innerHTML=empty("No results. You can enter the album manually.");return}
+    $("lookup-results").innerHTML=results.map(r=>`<button type="button" class="lookup-result" data-mbid="${safeText(r.id)}" data-title="${safeText(r.title)}" data-artist="${safeText(r["artist-credit"]?.map(x=>x.name||x.artist?.name).join("")||"")}" data-year="${safeText((r["first-release-date"]||"").slice(0,4))}"><span class="mini-cover">${safeText(initials(r.title))}</span><div><strong>${safeText(r.title)}</strong><small>${safeText(r["artist-credit"]?.map(x=>x.name||x.artist?.name).join("")||"Unknown artist")} · ${safeText((r["first-release-date"]||"").slice(0,4)||"Year unknown")}</small></div><span>＋</span></button>`).join("");
+    $("lookup-results").querySelectorAll("[data-mbid]").forEach(b=>b.onclick=async()=>{
+      $("album-title").value=b.dataset.title;$("album-artist").value=b.dataset.artist;$("album-year").value=b.dataset.year;
+      $("album-lookup").value=b.dataset.title;
+      const cover=`https://coverartarchive.org/release-group/${b.dataset.mbid}/front-250`;
+      try{const check=await fetch(cover,{method:"HEAD"});$("album-cover").value=check.ok?cover:""}catch{$("album-cover").value=""}
+      toast("Album details imported. Review and complete the form.");
+    });
+  }catch(err){$("lookup-results").innerHTML=empty(`${err.message} Add the album manually instead.`)}
+}
+async function removeAlbum(id){
+  const a=albums.find(x=>x.id===id);if(!a||!confirm(`Remove "${a.title}" from your archive?`))return;
+  try{
+    await deleteDoc(doc(userAlbums(),id));
+    await Promise.all(rankings.filter(r=>(r.albumIds||[]).includes(id)).map(r=>updateDoc(doc(userRankings(),r.id),{albumIds:r.albumIds.filter(x=>x!==id),updatedAt:serverTimestamp()})));
+    await loadData();toast("Album removed.");
+  }catch(err){toast("Could not remove album: "+err.message)}
+}
+function openDetail(id){
+  const a=albums.find(x=>x.id===id);if(!a)return;
+  $("detail-content").innerHTML=`<div class="modal-head" style="padding:20px 22px 0;border:0;margin:0"><p class="eyebrow">FROM YOUR ARCHIVE</p><button class="icon-button" id="detail-close">×</button></div><div class="detail-inner">${a.coverUrl?`<img class="detail-cover" src="${safeText(a.coverUrl)}" alt="">`:`<div class="detail-cover cover-fallback">${safeText(initials(a.title))}</div>`}<div class="detail-copy"><p class="eyebrow">${a.status==="wishlist"?"WANT TO LISTEN":"ALBUM DETAILS"}</p><h2>${safeText(a.title)}</h2><p class="artist">${safeText(a.artist)}</p><p class="detail-year">${safeText(a.releaseYear||"YEAR UNKNOWN")} · ${safeText(a.genre||"GENRE UNSPECIFIED")}</p><p class="rating">${a.rating!=null?`★ ${safeText(a.rating)} / 10`:"NOT RATED"} ${a.isFavorite?" · ♥ FAVORITE":""}</p><p class="eyebrow" style="margin-top:17px">LISTENING DATE</p><p>${safeText(fmtDate(a.listeningDate))}</p><p class="eyebrow" style="margin-top:15px">TRACKLIST</p><div class="detail-tracklist">${safeText((a.tracklist||[]).join("\n")||"No tracklist added.")}</div><div class="detail-review">${safeText(a.review||"No personal review yet.")}</div><div class="detail-actions"><button class="button button-primary" id="detail-edit">Edit record</button>${a.status==="wishlist"?`<button class="button button-outline" id="detail-move">Move to collection</button>`:""}<button class="button button-outline" id="detail-delete">Remove</button></div></div></div>`;
+  $("detail-close").onclick=()=>detailDialog.close();
+  $("detail-edit").onclick=()=>{detailDialog.close();openAlbumForm(id)};
+  $("detail-delete").onclick=()=>{detailDialog.close();removeAlbum(id)};
+  if($("detail-move"))$("detail-move").onclick=async()=>{await updateDoc(doc(userAlbums(),id),{status:"owned",dateAdded:serverTimestamp()});detailDialog.close();await loadData();toast("Moved to your collection.")};
+  detailDialog.showModal();
+}
+async function openRankingForm(r=null){
+  editingRankingId=r?.id||null;$("ranking-modal-title").textContent=r?"Edit ranking":"New ranking";
+  $("ranking-title").value=r?.title||"";$("ranking-description").value=r?.description||"";$("ranking-form-message").textContent="";
+  rankingDialog.showModal();
+}
+async function saveRanking(e){
+  e.preventDefault();const data={title:$("ranking-title").value.trim(),description:$("ranking-description").value.trim(),updatedAt:serverTimestamp()};
+  try{
+    if(editingRankingId)await updateDoc(doc(userRankings(),editingRankingId),data);
+    else{const ref=await addDoc(userRankings(),{...data,albumIds:[],createdAt:serverTimestamp(),userId:currentUser.uid});selectedRankingId=ref.id}
+    rankingDialog.close();await loadData();showPage("rankings");toast("Ranking saved.");
+  }catch(err){$("ranking-form-message").textContent=err.message}
+}
+async function deleteRanking(id){const r=rankings.find(x=>x.id===id);if(!r||!confirm(`Delete ranking "${r.title}"? Albums in your collection will not be deleted.`))return;await deleteDoc(doc(userRankings(),id));selectedRankingId=null;await loadData();toast("Ranking deleted.")}
+async function addToRanking(rid,aid){if(!aid)return;const r=rankings.find(x=>x.id===rid);if(!r)return;await updateDoc(doc(userRankings(),rid),{albumIds:[...(r.albumIds||[]),aid],updatedAt:serverTimestamp()});await loadData()}
+async function removeFromRanking(rid,aid){const r=rankings.find(x=>x.id===rid);if(!r)return;await updateDoc(doc(userRankings(),rid),{albumIds:(r.albumIds||[]).filter(x=>x!==aid),updatedAt:serverTimestamp()});await loadData()}
+async function reorderRanking(rid,from,to){const r=rankings.find(x=>x.id===rid);if(!r)return;const ids=[...(r.albumIds||[])],i=ids.indexOf(from),j=ids.indexOf(to);if(i<0||j<0)return;ids.splice(i,1);ids.splice(j,0,from);await updateDoc(doc(userRankings(),rid),{albumIds:ids,updatedAt:serverTimestamp()});await loadData()}
+async function shiftRank(rid,albumId,offset){const r=rankings.find(x=>x.id===rid);if(!r)return;const ids=[...(r.albumIds||[])],i=ids.indexOf(albumId),j=i+offset;if(i<0||j<0||j>=ids.length)return;[ids[i],ids[j]]=[ids[j],ids[i]];await updateDoc(doc(userRankings(),rid),{albumIds:ids,updatedAt:serverTimestamp()});await loadData()}
+function wire(){
+  document.querySelectorAll("[data-page]").forEach(b=>b.addEventListener("click",()=>showPage(b.dataset.page)));
+  $("mobile-menu").onclick=()=>$("sidebar").classList.toggle("open");
+  $("top-add").onclick=$("collection-add").onclick=()=>openAlbumForm();
+  $("wishlist-add").onclick=()=>openAlbumForm(null,{status:"wishlist"});
+  $("auth-form").addEventListener("submit",handleAuth);$("auth-switch").onclick=()=>setAuthMode("register");
+  $("toggle-password").onclick=()=>{$("auth-password").type=$("auth-password").type==="password"?"text":"password";$("toggle-password").textContent=$("auth-password").type==="password"?"SHOW":"HIDE"};
+  $("forgot-password").onclick=async()=>{const email=$("auth-email").value.trim();if(!email){$("auth-message").textContent="Masukkan email terlebih dahulu.";return}try{await sendPasswordResetEmail(auth,email);$("auth-message").textContent="Link reset password telah dikirim ke email."; $("auth-message").classList.add("success")}catch(e){$("auth-message").textContent=authError(e)}};
+  $("logout-button").onclick=()=>signOut(auth);
+  $("album-form").addEventListener("submit",saveAlbum);$("lookup-button").onclick=lookupAlbums;$("album-lookup").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();lookupAlbums()}});
+  $("new-ranking").onclick=()=>openRankingForm();$("ranking-form").addEventListener("submit",saveRanking);
+  $("collection-search").oninput=renderCollection;$("filter-genre").onchange=renderCollection;$("filter-year").onchange=renderCollection;$("filter-rating").onchange=renderCollection;$("sort-collection").onchange=renderCollection;
+  $("timeline-artist").oninput=renderTimeline;$("timeline-genre").onchange=renderTimeline;$("timeline-period").onchange=renderTimeline;
+  document.querySelectorAll("[data-view]").forEach(b=>b.onclick=()=>{collectionView=b.dataset.view;document.querySelectorAll("[data-view]").forEach(x=>x.classList.toggle("active",x===b));renderCollection()});
+  document.querySelectorAll(".close-modal").forEach(b=>b.addEventListener("click",()=>b.closest("dialog").close()));
+  $("today-label").textContent=new Date().toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"}).toUpperCase();
+}
+function boot(){
+  wire();
+  if(!configReady){setNotice("Firebase belum dikonfigurasi. Isi firebase-config.js mengikuti panduan README.md, lalu buka website melalui hosting atau local web server. Login dan penyimpanan belum aktif.");$("auth-screen").classList.remove("hidden");$("auth-message").textContent="Setup diperlukan: lengkapi firebase-config.js terlebih dahulu.";return}
+  try{const app=initializeApp(firebaseConfig);auth=getAuth(app);db=getFirestore(app);
+    onAuthStateChanged(auth,async user=>{
+      currentUser=user;
+      $("auth-screen").classList.toggle("hidden",!!user);$("app").classList.toggle("hidden",!user);
+      if(user){$("sidebar-email").textContent=user.email||"Your account";$("settings-email").textContent=user.email||"";setNotice("");try{await setDoc(doc(db,"users",user.uid),{email:user.email,updatedAt:serverTimestamp()},{merge:true});await loadData()}catch(err){setNotice("Gagal memuat data: "+err.message)}}
+    });
+  }catch(err){setNotice("Firebase configuration tidak valid: "+err.message)}
+}
+boot();
